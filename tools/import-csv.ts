@@ -1,4 +1,4 @@
-// tools/import-csv.ts
+// tools/import-csv.ts (с прогрес и таймер)
 import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
@@ -6,14 +6,25 @@ import csv from 'csv-parser';
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
 
+const prettyBytes = (bytes: number) => {
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let i = 0;
+  while (bytes >= 1024 && i < units.length - 1) {
+    bytes /= 1024;
+    i++;
+  }
+  return `${bytes.toFixed(2)} ${units[i]}`;
+};
+
 dotenv.config();
 
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/cms';
 const COLLECTION_NAME = 'serpdata';
 
 const filePath = process.argv[2];
+const MAX_ROWS = Number(process.env.MAX_ROWS || 100);
 if (!filePath) {
-  console.error('❌ Моля, подайте път до .csv.gz файла: npx ts-node tools/import-csv.ts ./data/serp/0.data.csv.gz');
+  console.error('❌ Моля, подайте път до .csv или .csv.gz файла: npx ts-node tools/import-csv.ts ./data/serp/0.data.csv(.gz)');
   process.exit(1);
 }
 
@@ -26,14 +37,33 @@ async function main() {
   let count = 0;
   const batchSize = 1000;
   let batch: any[] = [];
+  let bytesRead = 0;
+  let lastTime = Date.now();
 
-  const stream = fs.createReadStream(filePath)
-    .pipe(zlib.createGunzip())
-    .pipe(csv());
+  let fileStream: NodeJS.ReadableStream = fs.createReadStream(filePath);
+  if (filePath.endsWith('.gz')) {
+    fileStream = fileStream.pipe(zlib.createGunzip());
+    console.log('📂 Разархивиране на .gz файл...');
+  }
+
+  console.log('▶️ Поток стартиран...');
+
+  const stream = fileStream.pipe(csv());
 
   stream.on('data', async (row) => {
     try {
-      // Преобразуване на JSON полета ако има нужда
+      const rowSize = JSON.stringify(row).length;
+      bytesRead += rowSize;
+
+      if (count < 5) {
+        console.log('🔎 row:', row);
+      }
+
+      if (count >= MAX_ROWS) {
+        stream.destroy();
+        return;
+      }
+
       if (row['keyword_info.history']) {
         try {
           row['keyword_info.history'] = JSON.parse(row['keyword_info.history']);
@@ -51,11 +81,17 @@ async function main() {
       }
 
       batch.push(row);
+      count++;
+
       if (batch.length >= batchSize) {
         stream.pause();
-        await SerpModel.insertMany(batch, { ordered: false }).catch(() => {});
-        count += batch.length;
-        console.log(`📦 Импортирани ${count} реда...`);
+        const now = Date.now();
+        const duration = ((now - lastTime) / 1000).toFixed(2);
+        lastTime = now;
+        await SerpModel.insertMany(batch, { ordered: false }).catch((err) => {
+          console.error('❌ insertMany() error:', err.message);
+        });
+        console.log(`📦 Импортирани ${count} реда – ${prettyBytes(bytesRead)} общо (${duration}s)`);
         batch = [];
         stream.resume();
       }
@@ -66,10 +102,12 @@ async function main() {
 
   stream.on('end', async () => {
     if (batch.length > 0) {
-      await SerpModel.insertMany(batch, { ordered: false }).catch(() => {});
-      count += batch.length;
+      await SerpModel.insertMany(batch, { ordered: false }).catch((err) => {
+        console.error('❌ insertMany() error:', err.message);
+      });
+      console.log(`📦 Импортирани ${count} реда (финална партида)`);
     }
-    console.log(`✅ Импортът завършен. Общо редове: ${count}`);
+    console.log(`✅ Импортът завършен. Общо редове: ${count}, общ размер: ${prettyBytes(bytesRead)}`);
     await mongoose.disconnect();
   });
 }
